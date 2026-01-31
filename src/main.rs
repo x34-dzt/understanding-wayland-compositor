@@ -14,14 +14,27 @@ use wayland_client::{
     protocol::{wl_output::Transform, wl_registry},
 };
 use wayland_protocols_wlr::output_management::v1::client::{
-    zwlr_output_head_v1, zwlr_output_manager_v1, zwlr_output_mode_v1,
+    zwlr_output_head_v1, zwlr_output_manager_v1,
+    zwlr_output_mode_v1::{self, ZwlrOutputModeV1},
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Mode {
+    mode_id: ObjectId,
     mhz: i32,
     height: i32,
     width: i32,
+}
+
+impl Default for Mode {
+    fn default() -> Self {
+        Self {
+            mode_id: ObjectId::null(),
+            mhz: Default::default(),
+            height: Default::default(),
+            width: Default::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -32,6 +45,7 @@ struct Monitor {
     scale: f64,
     position_x: i32,
     position_y: i32,
+    mode: Option<ZwlrOutputModeV1>,
     transform: WEnum<Transform>,
 }
 
@@ -43,6 +57,7 @@ impl Default for Monitor {
             enabled: false,
             scale: 1.0,
             position_x: 0,
+            mode: None,
             position_y: 0,
             transform: WEnum::Value(Transform::Normal),
         }
@@ -51,10 +66,8 @@ impl Default for Monitor {
 
 #[derive(Debug)]
 struct AppState {
-    // Monitors keyed by their ZwlrOutputHeadV1 ObjectId
-    monitors: HashMap<ObjectId, Monitor>,
-    // Maps ZwlrOutputModeV1 ObjectId -> ZwlrOutputHeadV1 ObjectId (parent)
-    mode_to_head: HashMap<ObjectId, ObjectId>,
+    monitor_hash_map: HashMap<ObjectId, Monitor>,
+    mode_monitor_hash_map: HashMap<ObjectId, ObjectId>,
 }
 
 // Protocol: https://gitlab.freedesktop.org/wayland/wayland/-/blob/main/protocol/wayland.xml#L71
@@ -96,11 +109,20 @@ impl Dispatch<zwlr_output_manager_v1::ZwlrOutputManagerV1, ()> for AppState {
     ) {
         match event {
             zwlr_output_manager_v1::Event::Head { head } => {
-                state.monitors.insert(head.id(), Monitor::default());
+                state.monitor_hash_map.insert(head.id(), Monitor::default());
             }
             zwlr_output_manager_v1::Event::Done { serial: _ } => {
-                let monitors: Vec<&Monitor> = state.monitors.values().collect();
-                println!("{:#?}", monitors);
+                for monitor in state.monitor_hash_map.values() {
+                    let status = if monitor.enabled { "on" } else { "off" };
+                    println!("{} ({}) @ {},{}", monitor.name, status, monitor.position_x, monitor.position_y);
+                    for mode in &monitor.modes {
+                        let refresh = mode.mhz as f64 / 1000.0;
+                        let current = monitor.mode.as_ref().map(|m| m.id() == mode.mode_id).unwrap_or(false);
+                        let marker = if current { "*" } else { " " };
+                        println!("  {} {}x{} @ {:.0}Hz", marker, mode.width, mode.height, refresh);
+                    }
+                    println!();
+                }
             }
             _ => {}
         }
@@ -129,22 +151,25 @@ impl Dispatch<zwlr_output_head_v1::ZwlrOutputHeadV1, ()> for AppState {
         _: &wayland_client::QueueHandle<Self>,
     ) {
         let head_id = head.id();
-
-        if let zwlr_output_head_v1::Event::Mode { mode } = &event {
-            state.mode_to_head.insert(mode.id(), head_id.clone());
-            if let Some(monitor) = state.monitors.get_mut(&head_id) {
-                monitor.modes.push(Mode::default());
-            }
-            return;
-        }
-
-        let Some(monitor) = state.monitors.get_mut(&head_id) else {
+        let Some(monitor) = state.monitor_hash_map.get_mut(&head_id) else {
             return;
         };
+
+        if let zwlr_output_head_v1::Event::Mode { mode } = &event {
+            state.mode_monitor_hash_map.insert(mode.id(), head_id);
+            monitor.modes.push(Mode {
+                mode_id: mode.id(),
+                ..Default::default()
+            });
+            return;
+        }
 
         match event {
             zwlr_output_head_v1::Event::Name { name } => {
                 monitor.name = name;
+            }
+            zwlr_output_head_v1::Event::CurrentMode { mode } => {
+                monitor.mode = Some(mode);
             }
             zwlr_output_head_v1::Event::Enabled { enabled } => {
                 monitor.enabled = enabled != 0;
@@ -186,13 +211,10 @@ impl Dispatch<zwlr_output_mode_v1::ZwlrOutputModeV1, ()> for AppState {
         _: &wayland_client::QueueHandle<Self>,
     ) {
         let mode_id = mode_obj.id();
-        let Some(head_id) = state.mode_to_head.get(&mode_id) else {
+        let Some(monitor) = get_monitor_by_mode_id(state, &mode_id) else {
             return;
         };
-        let Some(monitor) = state.monitors.get_mut(head_id) else {
-            return;
-        };
-        let Some(mode) = monitor.modes.last_mut() else {
+        let Some(mode) = monitor.modes.iter_mut().find(|m| m.mode_id == mode_id) else {
             return;
         };
 
@@ -209,10 +231,25 @@ impl Dispatch<zwlr_output_mode_v1::ZwlrOutputModeV1, ()> for AppState {
     }
 }
 
+fn get_monitor_by_mode_id<'a>(
+    state: &'a mut AppState,
+    mode_id: &'a ObjectId,
+) -> Option<&'a mut Monitor> {
+    let Some(monitor_id) = state.mode_monitor_hash_map.get_mut(mode_id) else {
+        println!("couldn't find mode with the mode object id {}", mode_id);
+        return None;
+    };
+    let Some(monitor) = state.monitor_hash_map.get_mut(monitor_id) else {
+        println!("couldn't find monitor with the mode object id {}", mode_id);
+        return None;
+    };
+    Some(monitor)
+}
+
 fn main() {
     let mut state = AppState {
-        monitors: HashMap::new(),
-        mode_to_head: HashMap::new(),
+        monitor_hash_map: HashMap::new(),
+        mode_monitor_hash_map: HashMap::new(),
     };
     let conn = Connection::connect_to_env().expect("error: failed to connect to wayland server");
     let display_object = conn.display();
